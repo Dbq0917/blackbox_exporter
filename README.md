@@ -286,6 +286,17 @@ The ICMP probe requires elevated privileges to function:
 * *BSD*: root user is required.
 * *OS X*: No additional privileges are needed.
 
+When neither raw sockets nor unprivileged ping sockets are permitted, the
+ICMP probe fails with a log message that names the missing capability instead
+of looking like an unreachable target, for example:
+
+```
+level=ERROR msg="Error listening to socket" err="listen ip4:icmp 0.0.0.0: socket: operation not permitted" reason="permission denied: process lacks CAP_NET_RAW, required to open raw ICMP sockets; unprivileged ping sockets are not available to gid 1000 (net.ipv4.ping_group_range is \"1 0\"); grant CAP_NET_RAW (e.g. \"setcap cap_net_raw+ep blackbox_exporter\" or \"docker run --cap-add NET_RAW\") or allow unprivileged ping sockets via net.ipv4.ping_group_range"
+```
+
+Note that `dont_fragment` always requires raw sockets, as the DF bit cannot
+be set through unprivileged ping sockets.
+
 The UNIX probe requires the process owner to have write permissions (w) to the UNIX socket,
 and access permissions (x) to the directory structure the socket resides in.
 

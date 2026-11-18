@@ -16,6 +16,7 @@ package prober
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"log/slog"
 	"math/rand"
 	"net"
@@ -58,12 +59,30 @@ func getICMPSequence() uint16 {
 	return icmpSequence
 }
 
+// logSocketListenError logs a failed ICMP socket creation. When the failure
+// is caused by missing privileges it adds a "reason" attribute naming the
+// missing capability, so that permission problems are not mistaken for an
+// unreachable target. unprivilegedErr, if non-nil, is the error from the
+// unprivileged socket attempt that was already tried as a fallback.
+func logSocketListenError(logger *slog.Logger, msg string, err error, unprivilegedErr error) {
+	reason := icmpSocketPermissionReason(err)
+	if reason == "" {
+		logger.Error(msg, "err", err)
+		return
+	}
+	if unprivilegedErr != nil {
+		reason = fmt.Sprintf("%s; unprivileged fallback also failed: %v", reason, unprivilegedErr)
+	}
+	logger.Error(msg, "err", err, "reason", reason)
+}
+
 func ProbeICMP(ctx context.Context, target string, module config.Module, registry *prometheus.Registry, logger *slog.Logger) (success bool) {
 	var (
 		requestType     icmp.Type
 		replyType       icmp.Type
 		icmpConn        *icmp.PacketConn
 		v4RawConn       *ipv4.RawConn
+		unprivilegedErr error
 		hopLimitFlagSet = true
 
 		durationGaugeVec = prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -118,6 +137,7 @@ func ProbeICMP(ctx context.Context, target string, module config.Module, registr
 			// "udp" here means unprivileged -- not the protocol "udp".
 			icmpConn, err = icmp.ListenPacket("udp6", srcIP.String())
 			if err != nil {
+				unprivilegedErr = err
 				logger.Debug("Unable to do unprivileged listen on socket, will attempt privileged", "err", err)
 			} else {
 				privileged = false
@@ -127,7 +147,7 @@ func ProbeICMP(ctx context.Context, target string, module config.Module, registr
 		if privileged {
 			icmpConn, err = icmp.ListenPacket("ip6:ipv6-icmp", srcIP.String())
 			if err != nil {
-				logger.Error("Error listening to socket", "err", err)
+				logSocketListenError(logger, "Error listening to socket", err, unprivilegedErr)
 				return
 			}
 		}
@@ -150,7 +170,7 @@ func ProbeICMP(ctx context.Context, target string, module config.Module, registr
 			// sockets as it is not possible to set IP header level options.
 			netConn, err := net.ListenPacket("ip4:icmp", srcIP.String())
 			if err != nil {
-				logger.Error("Error listening to socket", "err", err)
+				logSocketListenError(logger, "Error listening to socket", err, nil)
 				return
 			}
 			defer netConn.Close()
@@ -170,6 +190,7 @@ func ProbeICMP(ctx context.Context, target string, module config.Module, registr
 			if tryUnprivileged {
 				icmpConn, err = icmp.ListenPacket("udp4", srcIP.String())
 				if err != nil {
+					unprivilegedErr = err
 					logger.Debug("Unable to do unprivileged listen on socket, will attempt privileged", "err", err)
 				} else {
 					privileged = false
@@ -179,7 +200,7 @@ func ProbeICMP(ctx context.Context, target string, module config.Module, registr
 			if privileged {
 				icmpConn, err = icmp.ListenPacket("ip4:icmp", srcIP.String())
 				if err != nil {
-					logger.Error("Error listening to socket", "err", err)
+					logSocketListenError(logger, "Error listening to socket", err, unprivilegedErr)
 					return
 				}
 			}
