@@ -94,6 +94,12 @@ modules:
     http:
       method: GET
       check_revoked: true
+  http_redirect_tracing:
+    prober: http
+    timeout: 5s
+    http:
+      method: GET
+      redirect_tracing: true
   tcp_starttls_check_revoked:
     prober: tcp
     timeout: 5s

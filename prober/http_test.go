@@ -763,6 +763,292 @@ func TestRedirectionLimit(t *testing.T) {
 	checkRegistryResults(expectedResults, mfs, t)
 }
 
+// TestRedirectTracingSlowHop verifies that with redirect_tracing enabled the
+// duration of every hop in a redirect chain is recorded individually, so a
+// single slow hop can be identified.
+func TestRedirectTracingSlowHop(t *testing.T) {
+	const slowHop = 2
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n, err := strconv.Atoi(strings.TrimPrefix(r.URL.Path, "/hop-"))
+		if err != nil {
+			n = 0
+		}
+		if n == slowHop {
+			time.Sleep(300 * time.Millisecond)
+		}
+		if n >= 3 {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		http.Redirect(w, r, fmt.Sprintf("/hop-%d", n+1), http.StatusFound)
+	}))
+	defer ts.Close()
+
+	registry := prometheus.NewRegistry()
+	testCTX, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	result := ProbeHTTP(testCTX, ts.URL,
+		config.Module{Timeout: 10 * time.Second, HTTP: config.HTTPProbe{
+			IPProtocolFallback: true,
+			RedirectTracing:    true,
+			HTTPClientConfig:   pconfig.DefaultHTTPClientConfig,
+		}}, registry, promslog.NewNopLogger())
+	if !result {
+		t.Fatalf("Redirect test failed unexpectedly")
+	}
+
+	mfs, err := registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	expectedResults := map[string]float64{
+		"probe_http_redirects":           3,
+		"probe_http_redirect_failed_hop": -1,
+	}
+	checkRegistryResults(expectedResults, mfs, t)
+
+	slowDuration, ok := getMetricWithLabels(mfs, "probe_http_redirect_duration_seconds", map[string]string{"hop": strconv.Itoa(slowHop)})
+	if !ok {
+		t.Fatalf("Expected duration metric for hop %d", slowHop)
+	}
+	if slowDuration < 0.25 {
+		t.Fatalf("Expected hop %d to take at least 250ms, got %f", slowHop, slowDuration)
+	}
+	for hop := 0; hop <= 3; hop++ {
+		if hop == slowHop {
+			continue
+		}
+		d, ok := getMetricWithLabels(mfs, "probe_http_redirect_duration_seconds", map[string]string{"hop": strconv.Itoa(hop)})
+		if !ok {
+			t.Fatalf("Expected duration metric for hop %d", hop)
+		}
+		if d >= slowDuration {
+			t.Fatalf("Expected hop %d (%fs) to be faster than the slow hop %d (%fs)", hop, d, slowHop, slowDuration)
+		}
+	}
+
+	statusCode, ok := getMetricWithLabels(mfs, "probe_http_redirect_status_code", map[string]string{"hop": "0"})
+	if !ok || statusCode != http.StatusFound {
+		t.Fatalf("Expected status code 302 for hop 0, got %v (present: %v)", statusCode, ok)
+	}
+	statusCode, ok = getMetricWithLabels(mfs, "probe_http_redirect_status_code", map[string]string{"hop": "3"})
+	if !ok || statusCode != http.StatusOK {
+		t.Fatalf("Expected status code 200 for hop 3, got %v (present: %v)", statusCode, ok)
+	}
+}
+
+// TestRedirectTracingIntermediateHopCertFailure verifies that when an
+// intermediate hop of a redirect chain fails TLS verification, the probe
+// failure is attributed to that hop and not to the final target.
+func TestRedirectTracingIntermediateHopCertFailure(t *testing.T) {
+	// Final target of the chain, never reached.
+	final := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer final.Close()
+
+	// Intermediate hop serving a certificate the probe does not trust.
+	intermediate := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, final.URL, http.StatusFound)
+	}))
+	defer intermediate.Close()
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, intermediate.URL, http.StatusFound)
+	}))
+	defer ts.Close()
+
+	registry := prometheus.NewRegistry()
+	testCTX, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	result := ProbeHTTP(testCTX, ts.URL,
+		config.Module{Timeout: 10 * time.Second, HTTP: config.HTTPProbe{
+			IPProtocolFallback: true,
+			RedirectTracing:    true,
+			HTTPClientConfig:   pconfig.DefaultHTTPClientConfig,
+		}}, registry, promslog.NewNopLogger())
+	if result {
+		t.Fatalf("Probe succeeded unexpectedly")
+	}
+
+	mfs, err := registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	expectedResults := map[string]float64{
+		"probe_http_status_code":         0,
+		"probe_http_redirect_failed_hop": 1,
+	}
+	checkRegistryResults(expectedResults, mfs, t)
+
+	statusCode, ok := getMetricWithLabels(mfs, "probe_http_redirect_status_code", map[string]string{"hop": "0"})
+	if !ok || statusCode != http.StatusFound {
+		t.Fatalf("Expected status code 302 for hop 0, got %v (present: %v)", statusCode, ok)
+	}
+	if _, ok := getMetricWithLabels(mfs, "probe_http_redirect_status_code", map[string]string{"hop": "1"}); ok {
+		t.Fatalf("Expected no status code for the failed hop 1")
+	}
+}
+
+// TestRedirectTracingTargetFailure verifies that a failure of the target
+// itself is reported as hop 0, distinguishing it from a redirect chain
+// failure.
+func TestRedirectTracingTargetFailure(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {}))
+	target := ts.URL
+	// Close the server so that the connection is refused.
+	ts.Close()
+
+	registry := prometheus.NewRegistry()
+	testCTX, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	result := ProbeHTTP(testCTX, target,
+		config.Module{Timeout: 10 * time.Second, HTTP: config.HTTPProbe{
+			IPProtocolFallback: true,
+			RedirectTracing:    true,
+			HTTPClientConfig:   pconfig.DefaultHTTPClientConfig,
+		}}, registry, promslog.NewNopLogger())
+	if result {
+		t.Fatalf("Probe succeeded unexpectedly")
+	}
+
+	mfs, err := registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	expectedResults := map[string]float64{
+		"probe_http_redirect_failed_hop": 0,
+	}
+	checkRegistryResults(expectedResults, mfs, t)
+}
+
+// TestRedirectTracingBudgetExhausted verifies that a redirect chain is
+// aborted early once the remaining probe timeout can no longer fund another
+// hop, instead of consuming the whole budget hop by hop.
+func TestRedirectTracingBudgetExhausted(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(50 * time.Millisecond)
+		n, err := strconv.Atoi(strings.TrimPrefix(r.URL.Path, "/redirect-"))
+		if err != nil {
+			n = 0
+		}
+		http.Redirect(w, r, fmt.Sprintf("/redirect-%d", n+1), http.StatusFound)
+	}))
+	defer ts.Close()
+
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+
+	registry := prometheus.NewRegistry()
+	testCTX, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	defer cancel()
+	result := ProbeHTTP(testCTX, ts.URL,
+		config.Module{Timeout: 400 * time.Millisecond, HTTP: config.HTTPProbe{
+			IPProtocolFallback: true,
+			RedirectTracing:    true,
+			HTTPClientConfig:   pconfig.DefaultHTTPClientConfig,
+		}}, registry, logger)
+	if result {
+		t.Fatalf("Probe succeeded unexpectedly")
+	}
+
+	if !strings.Contains(logBuf.String(), "redirect chain aborted") {
+		t.Fatalf("Expected the redirect chain to be aborted due to the per-hop budget, got logs: %s", logBuf.String())
+	}
+
+	mfs, err := registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	failedHop, ok := getMetricWithLabels(mfs, "probe_http_redirect_failed_hop", map[string]string{})
+	if !ok {
+		t.Fatalf("Expected probe_http_redirect_failed_hop metric")
+	}
+	if failedHop < 1 || failedHop > 8 {
+		t.Fatalf("Expected the chain to be aborted before the redirect limit, failed at hop %v", failedHop)
+	}
+}
+
+// TestRedirectTracingTLSCertInfo verifies that certificate information is
+// recorded for every TLS hop of a redirect chain.
+func TestRedirectTracingTLSCertInfo(t *testing.T) {
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" {
+			http.Redirect(w, r, "/final", http.StatusFound)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	registry := prometheus.NewRegistry()
+	testCTX, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	result := ProbeHTTP(testCTX, ts.URL,
+		config.Module{Timeout: 10 * time.Second, HTTP: config.HTTPProbe{
+			IPProtocolFallback: true,
+			RedirectTracing:    true,
+			HTTPClientConfig: pconfig.HTTPClientConfig{
+				FollowRedirects: true,
+				TLSConfig:       pconfig.TLSConfig{InsecureSkipVerify: true},
+			},
+		}}, registry, promslog.NewNopLogger())
+	if !result {
+		t.Fatalf("Redirect test failed unexpectedly")
+	}
+
+	mfs, err := registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, hop := range []string{"0", "1"} {
+		expiry, ok := getMetricWithLabels(mfs, "probe_http_redirect_ssl_earliest_cert_expiry", map[string]string{"hop": hop})
+		if !ok || expiry <= 0 {
+			t.Fatalf("Expected certificate expiry metric for hop %s, got %v (present: %v)", hop, expiry, ok)
+		}
+		if _, ok := getMetricWithLabels(mfs, "probe_http_redirect_ssl_last_chain_info", map[string]string{"hop": hop}); !ok {
+			t.Fatalf("Expected certificate chain info metric for hop %s", hop)
+		}
+	}
+}
+
+// TestRedirectTracingDisabledByDefault verifies that no redirect tracing
+// metrics are exported unless the module opts in.
+func TestRedirectTracingDisabledByDefault(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	registry := prometheus.NewRegistry()
+	testCTX, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	result := ProbeHTTP(testCTX, ts.URL,
+		config.Module{Timeout: time.Second, HTTP: config.HTTPProbe{
+			IPProtocolFallback: true,
+			HTTPClientConfig:   pconfig.DefaultHTTPClientConfig,
+		}}, registry, promslog.NewNopLogger())
+	if !result {
+		t.Fatalf("Probe failed unexpectedly")
+	}
+
+	mfs, err := registry.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mf := range mfs {
+		if strings.HasPrefix(mf.GetName(), "probe_http_redirect_") {
+			t.Fatalf("Expected no redirect tracing metrics by default, found %s", mf.GetName())
+		}
+	}
+}
+
 func TestPost(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "POST" {

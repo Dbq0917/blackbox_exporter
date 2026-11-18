@@ -121,6 +121,23 @@ then a single address is selected to test, using the following logic:
   # Whether or not the probe will follow any redirects.
   [ follow_redirects: <boolean> | default = true ]
 
+  # Record per-hop metrics for redirect chains and enforce a per-hop share of
+  # the probe timeout.
+  #
+  # When enabled, the probe exports probe_http_redirect_duration_seconds,
+  # probe_http_redirect_status_code, probe_http_redirect_ssl_earliest_cert_expiry
+  # and probe_http_redirect_ssl_last_chain_info with a "hop" label identifying
+  # each request of the redirect chain (0 is the original target), and
+  # probe_http_redirect_failed_hop indicating which hop failed (-1 when no hop
+  # failed), so a failure of an intermediate hop can be told apart from a
+  # failure of the final target.
+  #
+  # The redirect chain shares the probe timeout: each hop is allotted half of
+  # the remaining budget, so no hop can starve the following ones. When the
+  # remaining budget can no longer fund a hop (below 100ms), the chain is
+  # aborted early instead of consuming the whole timeout.
+  [ redirect_tracing: <boolean> | default = false ]
+
   # Probe fails if SSL is present.
   [ fail_if_ssl: <boolean> | default = false ]
 

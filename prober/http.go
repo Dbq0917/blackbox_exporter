@@ -163,6 +163,10 @@ func matchRegularExpressionsOnHeaders(header http.Header, httpConfig config.HTTP
 // roundTripTrace holds timings for a single HTTP roundtrip.
 type roundTripTrace struct {
 	tls           bool
+	hopStart      time.Time
+	url           string
+	statusCode    int
+	tlsState      *tls.ConnectionState
 	start         time.Time
 	dnsDone       time.Time
 	connectDone   time.Time
@@ -179,31 +183,94 @@ type transport struct {
 	NoServerNameTransport http.RoundTripper
 	firstHost             string
 	logger                *slog.Logger
+	redirectTracing       bool
 
 	mu      sync.Mutex
 	traces  []*roundTripTrace
 	current *roundTripTrace
 }
 
-func newTransport(rt, noServerName http.RoundTripper, logger *slog.Logger) *transport {
+func newTransport(rt, noServerName http.RoundTripper, logger *slog.Logger, redirectTracing bool) *transport {
 	return &transport{
 		Transport:             rt,
 		NoServerNameTransport: noServerName,
 		logger:                logger,
+		redirectTracing:       redirectTracing,
 		traces:                []*roundTripTrace{},
 	}
 }
 
+// minRedirectHopBudget is the minimum share of the remaining probe timeout
+// that a redirect hop must be allotted. Once the geometric split of the
+// remaining budget drops below it, the chain is aborted instead of letting
+// further hops run with no realistic chance to complete.
+const minRedirectHopBudget = 100 * time.Millisecond
+
 // RoundTrip switches to a new trace, then runs embedded RoundTripper.
 func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	t.logger.Debug("Making HTTP request", "url", req.URL.String(), "host", req.Host)
-	trace := &roundTripTrace{}
+	trace := &roundTripTrace{
+		hopStart: time.Now(),
+		url:      req.URL.String(),
+	}
 	if req.URL.Scheme == "https" {
 		trace.tls = true
 	}
 	t.current = trace
 	t.traces = append(t.traces, trace)
 
+	var cancel context.CancelFunc
+	if t.redirectTracing {
+		// Give this hop half of the remaining probe timeout. Successive
+		// hops keep halving what is left, so the whole chain shares the
+		// overall budget and no hop can starve the ones after it.
+		if deadline, ok := req.Context().Deadline(); ok {
+			remaining := time.Until(deadline)
+			hopBudget := remaining / 2
+			if hopBudget < minRedirectHopBudget {
+				t.logger.Debug("Aborting redirect chain, not enough probe timeout left for another hop",
+					"url", req.URL.String(), "remaining", remaining)
+				return nil, fmt.Errorf("redirect chain aborted: remaining probe timeout %v is below the minimum per-hop budget %v", remaining, minRedirectHopBudget)
+			}
+			ctx, cancelFunc := context.WithTimeout(req.Context(), hopBudget)
+			cancel = cancelFunc
+			req = req.WithContext(ctx)
+		}
+	}
+
+	resp, err := t.roundTrip(req)
+	if err != nil {
+		if cancel != nil {
+			cancel()
+		}
+		return resp, err
+	}
+
+	if t.redirectTracing {
+		trace.statusCode = resp.StatusCode
+		if resp.TLS != nil {
+			tlsState := *resp.TLS
+			trace.tlsState = &tlsState
+		}
+		resp.Body = &hopBody{
+			ReadCloser: resp.Body,
+			onClose: func() {
+				t.mu.Lock()
+				trace.end = time.Now()
+				t.mu.Unlock()
+				if cancel != nil {
+					cancel()
+				}
+			},
+		}
+	}
+
+	return resp, nil
+}
+
+// roundTrip runs the embedded RoundTripper, switching to the ServerName-less
+// transport on redirects to a different host.
+func (t *transport) roundTrip(req *http.Request) (*http.Response, error) {
 	if t.firstHost == "" {
 		t.firstHost = req.URL.Host
 	}
@@ -221,6 +288,20 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 
 	return t.Transport.RoundTrip(req)
+}
+
+// hopBody records when a response body is closed, marking the end of a
+// redirect hop, and releases the per-hop timeout budget.
+type hopBody struct {
+	io.ReadCloser
+	onClose func()
+	once    sync.Once
+}
+
+func (b *hopBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.once.Do(b.onClose)
+	return err
 }
 
 func (t *transport) DNSStart(_ httptrace.DNSStartInfo) {
@@ -362,6 +443,31 @@ func ProbeHTTP(ctx context.Context, target string, module config.Module, registr
 			Name: "probe_http_last_modified_timestamp_seconds",
 			Help: "Returns the Last-Modified HTTP response header in unixtime",
 		})
+
+		redirectDurationGaugeVec = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "probe_http_redirect_duration_seconds",
+			Help: "Duration of each HTTP request in the redirect chain by hop index",
+		}, []string{"hop"})
+
+		redirectStatusCodeGaugeVec = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "probe_http_redirect_status_code",
+			Help: "Response HTTP status code for each hop in the redirect chain",
+		}, []string{"hop"})
+
+		redirectSSLEarliestCertExpiryGaugeVec = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "probe_http_redirect_ssl_earliest_cert_expiry",
+			Help: "Earliest SSL certificate expiry for each hop in the redirect chain",
+		}, []string{"hop"})
+
+		redirectSSLChainInfoGaugeVec = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "probe_http_redirect_ssl_last_chain_info",
+			Help: "Contains SSL leaf certificate information for each hop in the redirect chain",
+		}, []string{"hop", "fingerprint_sha256", "subject", "issuer", "subjectalternative", "serialnumber"})
+
+		redirectFailedHopGauge = prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "probe_http_redirect_failed_hop",
+			Help: "Index of the redirect chain hop that failed, -1 if no hop failed",
+		})
 	)
 
 	registry.MustRegister(durationGaugeVec)
@@ -374,6 +480,11 @@ func ProbeHTTP(ctx context.Context, target string, module config.Module, registr
 	registry.MustRegister(probeFailedDueToRegex)
 
 	httpConfig := module.HTTP
+
+	if httpConfig.RedirectTracing {
+		registry.MustRegister(redirectDurationGaugeVec, redirectStatusCodeGaugeVec,
+			redirectSSLEarliestCertExpiryGaugeVec, redirectSSLChainInfoGaugeVec, redirectFailedHopGauge)
+	}
 
 	if httpConfig.FailIfBodyJSONMatchesCEL != nil || httpConfig.FailIfBodyJSONNotMatchesCEL != nil {
 		registry.MustRegister(probeFailedDueToCEL)
@@ -481,7 +592,7 @@ func ProbeHTTP(ctx context.Context, target string, module config.Module, registr
 
 	// Inject transport that tracks traces for each redirect,
 	// and does not set TLS ServerNames on redirect if needed.
-	tt := newTransport(client.Transport, noServerName, logger)
+	tt := newTransport(client.Transport, noServerName, logger, httpConfig.RedirectTracing)
 
 	client.Transport = tt
 
@@ -586,6 +697,10 @@ func ProbeHTTP(ctx context.Context, target string, module config.Module, registr
 	}
 
 	resp, err := client.Do(request)
+	requestFinished := time.Now()
+	// A nil response means the request chain itself failed (connection,
+	// TLS or timeout), as opposed to a redirect that was not followed.
+	requestFailed := resp == nil && err != nil
 	// This is different from the usual err != nil you'd expect here because err won't be nil if redirects were
 	// turned off. See https://github.com/golang/go/issues/3795
 	//
@@ -724,6 +839,7 @@ func ProbeHTTP(ctx context.Context, target string, module config.Module, registr
 		logger.Debug(
 			"Response timings for roundtrip",
 			"roundtrip", i,
+			"url", trace.url,
 			"start", trace.start,
 			"dnsDone", trace.dnsDone,
 			"connectDone", trace.connectDone,
@@ -761,6 +877,36 @@ func ProbeHTTP(ctx context.Context, target string, module config.Module, registr
 			continue
 		}
 		durationGaugeVec.WithLabelValues("transfer").Add(trace.end.Sub(trace.responseStart).Seconds())
+	}
+
+	if httpConfig.RedirectTracing {
+		failedHop := -1
+		if requestFailed && len(tt.traces) > 0 {
+			failedHop = len(tt.traces) - 1
+		}
+		for i, trace := range tt.traces {
+			hop := strconv.Itoa(i)
+			end := trace.end
+			if end.IsZero() {
+				// The hop never completed, use the time the request
+				// chain returned as its end.
+				end = requestFinished
+			}
+			redirectDurationGaugeVec.WithLabelValues(hop).Set(end.Sub(trace.hopStart).Seconds())
+			if trace.statusCode != 0 {
+				redirectStatusCodeGaugeVec.WithLabelValues(hop).Set(float64(trace.statusCode))
+			}
+			if trace.tlsState != nil {
+				redirectSSLEarliestCertExpiryGaugeVec.WithLabelValues(hop).Set(float64(getEarliestCertExpiry(trace.tlsState).Unix()))
+				redirectSSLChainInfoGaugeVec.WithLabelValues(hop, getFingerprint(trace.tlsState), getSubject(trace.tlsState), getIssuer(trace.tlsState), getDNSNames(trace.tlsState), getSerialNumber(trace.tlsState)).Set(1)
+			}
+		}
+		redirectFailedHopGauge.Set(float64(failedHop))
+		if failedHop > 0 {
+			logger.Error("Redirect chain failed at intermediate hop", "hop", failedHop, "url", tt.traces[failedHop].url)
+		} else if failedHop == 0 {
+			logger.Error("HTTP request to target failed", "url", tt.traces[0].url)
+		}
 	}
 
 	if resp.TLS != nil {

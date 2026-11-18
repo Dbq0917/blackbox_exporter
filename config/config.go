@@ -330,6 +330,7 @@ type HTTPProbe struct {
 	BodySizeLimit                units.Base2Bytes        `yaml:"body_size_limit,omitempty" json:"body_size_limit,omitempty"`
 	UseHTTP3                     bool                    `yaml:"enable_http3,omitempty" json:"enable_http3,omitempty"`
 	CheckRevoked                 bool                    `yaml:"check_revoked,omitempty" json:"check_revoked,omitempty"`
+	RedirectTracing              bool                    `yaml:"redirect_tracing,omitempty" json:"redirect_tracing,omitempty"`
 }
 
 type GRPCProbe struct {

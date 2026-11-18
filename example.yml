@@ -36,6 +36,12 @@ modules:
     http:
       proxy_url: "http://127.0.0.1:3128"
       skip_resolve_phase_with_proxy: true
+  http_redirect_tracing:
+    prober: http
+    timeout: 5s
+    http:
+      follow_redirects: true
+      redirect_tracing: true
   http_with_proxy_and_headers:
     prober: http
     http:
