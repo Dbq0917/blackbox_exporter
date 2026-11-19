@@ -79,11 +79,17 @@ func dialTCP(ctx context.Context, target string, module config.Module, registry 
 		// via tlsConfig to enable hostname verification.
 		tlsConfig.ServerName = targetAddress
 	}
-	timeoutDeadline, _ := ctx.Deadline()
-	dialer.Deadline = timeoutDeadline
 
+	// Dial with the probe context instead of relying on tls.DialWithDialer,
+	// which dials with context.Background(). Context cancellation then
+	// interrupts both the TCP dial and the TLS handshake and closes the
+	// socket, rather than only expiring the wait.
+	tlsDialer := tls.Dialer{
+		NetDialer: dialer,
+		Config:    tlsConfig,
+	}
 	logger.Debug("Dialing TCP with TLS")
-	return tls.DialWithDialer(dialer, dialProtocol, dialTarget, tlsConfig)
+	return tlsDialer.DialContext(ctx, dialProtocol, dialTarget)
 }
 
 func ProbeTCP(ctx context.Context, target string, module config.Module, registry *prometheus.Registry, logger *slog.Logger) bool {

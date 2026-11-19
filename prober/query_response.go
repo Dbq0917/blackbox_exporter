@@ -190,7 +190,10 @@ func probeQueryResponses(ctx context.Context, target string, conn net.Conn, modu
 			defer tlsConn.Close()
 
 			// Initiate TLS handshake (required here to get TLS state).
-			if err := tlsConn.Handshake(); err != nil {
+			// HandshakeContext interrupts the handshake and closes the
+			// underlying connection when the probe context is cancelled, so a
+			// timed-out probe cannot leave the socket open.
+			if err := tlsConn.HandshakeContext(ctx); err != nil {
 				logger.Error("TLS Handshake (client) failed", "err", err)
 				return false
 			}

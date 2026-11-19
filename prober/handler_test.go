@@ -60,7 +60,7 @@ func TestPrometheusTimeoutHTTP(t *testing.T) {
 
 	rr := httptest.NewRecorder()
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		Handler(w, r, c, promslog.NewNopLogger(), &ResultHistory{}, 0.5, nil, nil, &promslog.Config{})
+		Handler(w, r, c, promslog.NewNopLogger(), &ResultHistory{}, 0.5, nil, nil, NewProbeConcurrencyLimit(0), &promslog.Config{})
 	})
 
 	handler.ServeHTTP(rr, req)
@@ -86,7 +86,7 @@ func TestPrometheusConfigSecretsHidden(t *testing.T) {
 	}
 	rr := httptest.NewRecorder()
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		Handler(w, r, c, promslog.NewNopLogger(), &ResultHistory{}, 0.5, nil, nil, &promslog.Config{})
+		Handler(w, r, c, promslog.NewNopLogger(), &ResultHistory{}, 0.5, nil, nil, NewProbeConcurrencyLimit(0), &promslog.Config{})
 	})
 	handler.ServeHTTP(rr, req)
 
@@ -228,7 +228,7 @@ func TestHostnameParam(t *testing.T) {
 	rr := httptest.NewRecorder()
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		Handler(w, r, c, promslog.NewNopLogger(), &ResultHistory{}, 0.5, nil, nil, &promslog.Config{})
+		Handler(w, r, c, promslog.NewNopLogger(), &ResultHistory{}, 0.5, nil, nil, NewProbeConcurrencyLimit(0), &promslog.Config{})
 	})
 
 	handler.ServeHTTP(rr, req)
@@ -246,7 +246,7 @@ func TestHostnameParam(t *testing.T) {
 	c.Modules["http_2xx"].HTTP.Headers["Host"] = hostname + ".something"
 
 	handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		Handler(w, r, c, promslog.NewNopLogger(), &ResultHistory{}, 0.5, nil, nil, &promslog.Config{})
+		Handler(w, r, c, promslog.NewNopLogger(), &ResultHistory{}, 0.5, nil, nil, NewProbeConcurrencyLimit(0), &promslog.Config{})
 	})
 
 	rr = httptest.NewRecorder()
@@ -293,7 +293,7 @@ func TestTCPHostnameParam(t *testing.T) {
 	rr := httptest.NewRecorder()
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		Handler(w, r, c, promslog.NewNopLogger(), &ResultHistory{}, 0.5, nil, nil, &promslog.Config{})
+		Handler(w, r, c, promslog.NewNopLogger(), &ResultHistory{}, 0.5, nil, nil, NewProbeConcurrencyLimit(0), &promslog.Config{})
 	})
 
 	handler.ServeHTTP(rr, req)
@@ -374,7 +374,7 @@ func TestURLDecoding(t *testing.T) {
 
 			rr := httptest.NewRecorder()
 			handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				Handler(w, r, c, promslog.NewNopLogger(), &ResultHistory{}, 0.5, nil, nil, &promslog.Config{})
+				Handler(w, r, c, promslog.NewNopLogger(), &ResultHistory{}, 0.5, nil, nil, NewProbeConcurrencyLimit(0), &promslog.Config{})
 			})
 
 			handler.ServeHTTP(rr, req)

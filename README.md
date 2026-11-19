@@ -189,6 +189,16 @@ Additional modules can be defined to meet your needs.
 The timeout of each probe is automatically determined from the `scrape_timeout` in the [Prometheus config](https://prometheus.io/docs/operating/configuration/#configuration-file), slightly reduced to allow for network delays. 
 This can be further limited by the `timeout` in the Blackbox exporter config file. If neither is specified, it defaults to 120 seconds.
 
+The number of probes that may run at the same time is bounded by the
+`--probe.max-concurrency` flag, which defaults to 500. When the limit is
+reached, additional `/probe` requests fail fast with HTTP `503 Service
+Unavailable` instead of queuing and opening more connections. This keeps the
+exporter below its file descriptor limit when many targets are unreachable,
+without adding latency to probes while capacity is available. Set the flag to
+`0` to disable the limit. A probe whose timeout fires while a connection
+(including a TLS handshake) is still in progress closes that connection and
+releases its file descriptor.
+
 ## Prometheus Configuration
 
 Blackbox exporter implements the multi-target exporter pattern, so we advice

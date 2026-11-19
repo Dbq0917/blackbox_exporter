@@ -56,6 +56,7 @@ var (
 	enableAutoReload   = kingpin.Flag("config.enable-auto-reload", "When enabled, Blackbox exporter will automatically reload its configuration file at a specified interval. The interval is defined by the `--config.auto-reload-interval` flag, which defaults to `30s`").Default().Bool()
 	autoReloadInterval = kingpin.Flag("config.auto-reload-interval", "Specifies the interval in seconds for checking and automatically reloading configuration file upon detecting changes.").Default("30").Uint()
 	historyLimit       = kingpin.Flag("history.limit", "The maximum amount of items to keep in the history.").Default("100").Uint()
+	probeMaxConcurrent = kingpin.Flag("probe.max-concurrency", "Maximum number of probes that may run at the same time. Probes above the limit are rejected with HTTP 503 instead of consuming more file descriptors. Set to 0 to disable the limit.").Default("500").Int()
 	externalURL        = kingpin.Flag("web.external-url", "The URL under which Blackbox exporter is externally reachable (for example, if Blackbox exporter is served via a reverse proxy). Used for generating relative and absolute links back to Blackbox exporter itself. If the URL has a path portion, it will be used to prefix all HTTP endpoints served by Blackbox exporter. If omitted, relevant URL components will be derived automatically.").PlaceHolder("<url>").String()
 	routePrefix        = kingpin.Flag("web.route-prefix", "Prefix for the internal routes of web endpoints. Defaults to path of --web.external-url.").PlaceHolder("<path>").String()
 	toolkitFlags       = webflag.AddFlags(kingpin.CommandLine, ":9115")
@@ -83,6 +84,7 @@ func run() int {
 	kingpin.Parse()
 	logger := promslog.New(promslogConfig)
 	rh := &prober.ResultHistory{MaxResults: *historyLimit}
+	probeLimiter := prober.NewProbeConcurrencyLimit(*probeMaxConcurrent)
 
 	probeLogLevel := promslog.NewLevel()
 	if err := probeLogLevel.Set(*logLevelProber); err != nil {
@@ -208,7 +210,7 @@ func run() int {
 		sc.Lock()
 		conf := sc.C
 		sc.Unlock()
-		prober.Handler(w, r, conf, logger, rh, *timeoutOffset, nil, moduleUnknownCounter, scrapeLoggerConfig)
+		prober.Handler(w, r, conf, logger, rh, *timeoutOffset, nil, moduleUnknownCounter, probeLimiter, scrapeLoggerConfig)
 	})
 	http.HandleFunc(*routePrefix, func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/html")

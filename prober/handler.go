@@ -45,7 +45,7 @@ var Probers = map[string]ProbeFn{
 }
 
 func Handler(w http.ResponseWriter, r *http.Request, c *config.Config, logger *slog.Logger, rh *ResultHistory, timeoutOffset float64, params url.Values,
-	moduleUnknownCounter prometheus.Counter,
+	moduleUnknownCounter prometheus.Counter, limiter *ProbeConcurrencyLimit,
 	promslogConfig *promslog.Config,
 ) {
 	if params == nil {
@@ -123,6 +123,14 @@ func Handler(w http.ResponseWriter, r *http.Request, c *config.Config, logger *s
 	slLogger := slog.New(sl)
 
 	slLogger.Debug("Beginning probe", "probe", module.Prober, "timeout_seconds", timeoutSeconds)
+
+	release, acquired := limiter.TryAcquire()
+	if !acquired {
+		http.Error(w, "Too many concurrent probes, rejecting the probe to protect the exporter from resource exhaustion", http.StatusServiceUnavailable)
+		logger.Error("Probe rejected because the probe concurrency limit was reached")
+		return
+	}
+	defer release()
 
 	start := time.Now()
 	registry := prometheus.NewRegistry()
