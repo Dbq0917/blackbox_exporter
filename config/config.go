@@ -95,12 +95,19 @@ type Config struct {
 	Modules map[string]Module `yaml:"modules" json:"modules"`
 }
 
+// Snapshot implements the prober.ConfigSource interface. A plain Config is
+// immutable, so it never signals updates.
+func (c *Config) Snapshot() (*Config, <-chan struct{}) {
+	return c, nil
+}
+
 type SafeConfig struct {
 	sync.RWMutex
 	C                   *Config
 	configReloadSuccess prometheus.Gauge
 	configReloadSeconds prometheus.Gauge
 	configChecksum      string
+	configChanged       chan struct{}
 }
 
 func NewSafeConfig(reg prometheus.Registerer) *SafeConfig {
@@ -115,7 +122,32 @@ func NewSafeConfig(reg prometheus.Registerer) *SafeConfig {
 		Name:      "config_last_reload_success_timestamp_seconds",
 		Help:      "Timestamp of the last successful configuration reload.",
 	})
-	return &SafeConfig{C: &Config{}, configReloadSuccess: configReloadSuccess, configReloadSeconds: configReloadSeconds}
+	return &SafeConfig{
+		C:                   &Config{},
+		configReloadSuccess: configReloadSuccess,
+		configReloadSeconds: configReloadSeconds,
+		configChanged:       make(chan struct{}),
+	}
+}
+
+// Snapshot returns the current configuration and a channel that is closed on
+// the next successful reload. The configuration is immutable, so callers can
+// keep using the returned pointer after the lock is released.
+func (sc *SafeConfig) Snapshot() (*Config, <-chan struct{}) {
+	sc.RLock()
+	if sc.configChanged != nil {
+		c, changed := sc.C, sc.configChanged
+		sc.RUnlock()
+		return c, changed
+	}
+	sc.RUnlock()
+
+	sc.Lock()
+	defer sc.Unlock()
+	if sc.configChanged == nil {
+		sc.configChanged = make(chan struct{})
+	}
+	return sc.C, sc.configChanged
 }
 
 func (sc *SafeConfig) ReloadConfig(confFile string, logger *slog.Logger) (err error) {
@@ -175,6 +207,12 @@ func (sc *SafeConfig) ReloadConfig(confFile string, logger *slog.Logger) (err er
 	sc.Lock()
 	sc.C = c
 	sc.configChecksum = currentConfigChecksum
+	if sc.configChanged == nil {
+		sc.configChanged = make(chan struct{})
+	} else {
+		close(sc.configChanged)
+		sc.configChanged = make(chan struct{})
+	}
 	sc.Unlock()
 
 	return nil

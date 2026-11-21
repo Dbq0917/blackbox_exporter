@@ -188,6 +188,7 @@ Additional modules can be defined to meet your needs.
 
 The timeout of each probe is automatically determined from the `scrape_timeout` in the [Prometheus config](https://prometheus.io/docs/operating/configuration/#configuration-file), slightly reduced to allow for network delays. 
 This can be further limited by the `timeout` in the Blackbox exporter config file. If neither is specified, it defaults to 120 seconds.
+Timeout changes in a reloaded configuration also apply to probes that are already running: a shorter timeout ends them when the new deadline passes, and a longer timeout extends their deadline.
 
 ## Prometheus Configuration
 

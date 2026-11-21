@@ -93,11 +93,10 @@ func probeQueryResponses(ctx context.Context, target string, conn net.Conn, modu
 		useTLS = module.Unix.TLS
 	}
 
-	deadline, _ := ctx.Deadline()
-	if err := conn.SetDeadline(deadline); err != nil {
-		logger.Error("Error setting deadline", "err", err)
-		return false
-	}
+	stop := context.AfterFunc(ctx, func() {
+		_ = conn.Close()
+	})
+	defer stop()
 
 	if useTLS {
 		state := conn.(*tls.Conn).ConnectionState()

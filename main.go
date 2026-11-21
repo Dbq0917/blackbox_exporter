@@ -205,10 +205,7 @@ func run() int {
 		w.Write([]byte("Healthy"))
 	})
 	http.HandleFunc(path.Join(*routePrefix, "/probe"), func(w http.ResponseWriter, r *http.Request) {
-		sc.Lock()
-		conf := sc.C
-		sc.Unlock()
-		prober.Handler(w, r, conf, logger, rh, *timeoutOffset, nil, moduleUnknownCounter, scrapeLoggerConfig)
+		prober.HandlerWithConfigSource(w, r, sc, logger, rh, *timeoutOffset, nil, moduleUnknownCounter, scrapeLoggerConfig)
 	})
 	http.HandleFunc(*routePrefix, func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/html")

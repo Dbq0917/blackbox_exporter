@@ -288,16 +288,17 @@ func ProbeICMP(ctx context.Context, target string, module config.Module, registr
 	}
 
 	rb := make([]byte, 65536)
-	deadline, _ := ctx.Deadline()
-	if icmpConn != nil {
-		err = icmpConn.SetReadDeadline(deadline)
-	} else {
-		err = v4RawConn.SetReadDeadline(deadline)
+	setReadDeadline := func(deadline time.Time) error {
+		if icmpConn != nil {
+			return icmpConn.SetReadDeadline(deadline)
+		}
+		return v4RawConn.SetReadDeadline(deadline)
 	}
-	if err != nil {
-		logger.Error("Error setting socket deadline", "err", err)
-		return
-	}
+	stop := context.AfterFunc(ctx, func() {
+		_ = setReadDeadline(time.Now())
+	})
+	defer stop()
+
 	logger.Debug("Waiting for reply packets")
 	for {
 		var n int

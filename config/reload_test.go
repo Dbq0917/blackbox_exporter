@@ -16,6 +16,9 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 func TestGenerateChecksum(t *testing.T) {
@@ -105,5 +108,55 @@ func testModification(t *testing.T, filePath string, originalContent []byte, ori
 	}
 	if restoredChecksum != originalChecksum {
 		t.Errorf("Checksum should be restored to original value, but it was not.\nOriginal: %s\nRestored: %s", originalChecksum, restoredChecksum)
+	}
+}
+
+func TestSafeConfigSnapshotSignalsReload(t *testing.T) {
+	configFile := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(configFile, []byte("modules:\n  http_2xx:\n    prober: http\n    timeout: 10s\n"), 0o644); err != nil {
+		t.Fatalf("Could not write initial file: %v", err)
+	}
+
+	sc := NewSafeConfig(prometheus.NewRegistry())
+	if err := sc.ReloadConfig(configFile, nil); err != nil {
+		t.Fatalf("Could not load initial config: %v", err)
+	}
+
+	initial, changed := sc.Snapshot()
+	if initial.Modules["http_2xx"].Timeout != 10*time.Second {
+		t.Fatalf("Unexpected initial timeout: %s", initial.Modules["http_2xx"].Timeout)
+	}
+
+	if err := os.WriteFile(configFile, []byte("modules:\n  http_2xx:\n    prober: http\n    timeout: 1s\n"), 0o644); err != nil {
+		t.Fatalf("Could not write updated file: %v", err)
+	}
+	if err := sc.ReloadConfig(configFile, nil); err != nil {
+		t.Fatalf("Could not reload config: %v", err)
+	}
+
+	select {
+	case <-changed:
+	default:
+		t.Fatal("Snapshot did not signal the reload")
+	}
+
+	updated, changed := sc.Snapshot()
+	if updated == initial {
+		t.Fatal("Snapshot returned the old configuration")
+	}
+	if updated.Modules["http_2xx"].Timeout != time.Second {
+		t.Fatalf("Unexpected updated timeout: %s", updated.Modules["http_2xx"].Timeout)
+	}
+
+	if err := os.WriteFile(configFile, []byte("not: valid\n"), 0o644); err != nil {
+		t.Fatalf("Could not write invalid file: %v", err)
+	}
+	if err := sc.ReloadConfig(configFile, nil); err == nil {
+		t.Fatal("Expected invalid configuration to be rejected")
+	}
+	select {
+	case <-changed:
+		t.Fatal("Failed reload signaled a configuration change")
+	default:
 	}
 }

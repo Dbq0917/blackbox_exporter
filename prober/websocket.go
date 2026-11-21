@@ -121,6 +121,10 @@ func ProbeWebsocket(ctx context.Context, target string, module config.Module, re
 		return false
 	}
 	defer connection.Close()
+	stop := context.AfterFunc(ctx, func() {
+		_ = connection.Close()
+	})
+	defer stop()
 
 	isConnected.Set(1)
 

@@ -23,6 +23,8 @@ import (
 	"net/textproto"
 	"net/url"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -44,7 +46,40 @@ var Probers = map[string]ProbeFn{
 	"websocket": ProbeWebsocket,
 }
 
-func Handler(w http.ResponseWriter, r *http.Request, c *config.Config, logger *slog.Logger, rh *ResultHistory, timeoutOffset float64, params url.Values,
+// ConfigSource provides an immutable configuration snapshot and a channel that
+// is closed when the configuration is replaced.
+type ConfigSource interface {
+	Snapshot() (*config.Config, <-chan struct{})
+}
+
+// Handler runs a probe using a configuration source. A plain *config.Config
+// provides a fixed snapshot, while *config.SafeConfig also propagates updates.
+func Handler(w http.ResponseWriter, r *http.Request, source ConfigSource, logger *slog.Logger, rh *ResultHistory, timeoutOffset float64, params url.Values,
+	moduleUnknownCounter prometheus.Counter,
+	promslogConfig *promslog.Config,
+) {
+	handlerWithSource(w, r, source, logger, rh, timeoutOffset, params, moduleUnknownCounter, promslogConfig)
+}
+
+// HandlerWithConfigSource runs a probe and applies timeout changes from source
+// to the probe while it is still running.
+func HandlerWithConfigSource(w http.ResponseWriter, r *http.Request, source ConfigSource, logger *slog.Logger, rh *ResultHistory, timeoutOffset float64, params url.Values,
+	moduleUnknownCounter prometheus.Counter,
+	promslogConfig *promslog.Config,
+) {
+	handlerWithSource(w, r, source, logger, rh, timeoutOffset, params, moduleUnknownCounter, promslogConfig)
+}
+
+// HandlerWithSafeConfig is a convenience wrapper around
+// HandlerWithConfigSource for SafeConfig.
+func HandlerWithSafeConfig(w http.ResponseWriter, r *http.Request, sc *config.SafeConfig, logger *slog.Logger, rh *ResultHistory, timeoutOffset float64, params url.Values,
+	moduleUnknownCounter prometheus.Counter,
+	promslogConfig *promslog.Config,
+) {
+	handlerWithSource(w, r, sc, logger, rh, timeoutOffset, params, moduleUnknownCounter, promslogConfig)
+}
+
+func handlerWithSource(w http.ResponseWriter, r *http.Request, source ConfigSource, logger *slog.Logger, rh *ResultHistory, timeoutOffset float64, params url.Values,
 	moduleUnknownCounter prometheus.Counter,
 	promslogConfig *promslog.Config,
 ) {
@@ -55,6 +90,7 @@ func Handler(w http.ResponseWriter, r *http.Request, c *config.Config, logger *s
 	if moduleName == "" {
 		moduleName = "http_2xx"
 	}
+	c, configUpdates := source.Snapshot()
 	module, ok := c.Modules[moduleName]
 	if !ok {
 		http.Error(w, fmt.Sprintf("Unknown module %q", moduleName), http.StatusBadRequest)
@@ -70,10 +106,6 @@ func Handler(w http.ResponseWriter, r *http.Request, c *config.Config, logger *s
 		http.Error(w, fmt.Sprintf("Failed to parse timeout from Prometheus header: %s", err), http.StatusInternalServerError)
 		return
 	}
-
-	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(timeoutSeconds*float64(time.Second)))
-	defer cancel()
-	r = r.WithContext(ctx)
 
 	probeSuccessGauge := prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "probe_success",
@@ -125,22 +157,117 @@ func Handler(w http.ResponseWriter, r *http.Request, c *config.Config, logger *s
 	slLogger.Debug("Beginning probe", "probe", module.Prober, "timeout_seconds", timeoutSeconds)
 
 	start := time.Now()
+	initialTimeout := time.Duration(timeoutSeconds * float64(time.Second))
+	requestCtx := r.Context()
+	ctx := newProbeContext(requestCtx, start.Add(initialTimeout))
+	r = r.WithContext(ctx)
+	timeoutRequest := r
+
+	var currentTimeout atomic.Int64
+	currentTimeout.Store(int64(initialTimeout))
+
+	stopTimeoutWatch := make(chan struct{})
+	timeoutWatchDone := make(chan struct{})
+	go func() {
+		defer close(timeoutWatchDone)
+
+		initialDeadline, _ := ctx.Deadline()
+		timer := time.NewTimer(time.Until(initialDeadline))
+		defer timer.Stop()
+
+		updates := configUpdates
+		applyTimeout := func(logUpdate bool) {
+			newConfig, nextUpdates := source.Snapshot()
+			updates = nextUpdates
+
+			newModule, ok := newConfig.Modules[moduleName]
+			if !ok {
+				return
+			}
+			newTimeoutSeconds, err := getTimeout(timeoutRequest, newModule, timeoutOffset)
+			if err != nil {
+				return
+			}
+			newTimeout := time.Duration(newTimeoutSeconds * float64(time.Second))
+			if newTimeout == time.Duration(currentTimeout.Load()) {
+				return
+			}
+			currentTimeout.Store(int64(newTimeout))
+			ctx.setDeadline(start.Add(newTimeout))
+			if logUpdate {
+				slLogger.Debug("Probe timeout updated", "timeout_seconds", newTimeoutSeconds)
+			}
+		}
+		for {
+			select {
+			case <-requestCtx.Done():
+				ctx.finish(requestCtx.Err())
+				return
+			case <-timer.C:
+				applyTimeout(false)
+				deadline, _ := ctx.Deadline()
+				if !time.Now().Before(deadline) {
+					ctx.finish(context.DeadlineExceeded)
+					return
+				}
+				resetTimer(timer, time.Until(deadline))
+			case <-updates:
+				applyTimeout(true)
+				deadline, _ := ctx.Deadline()
+				resetTimer(timer, time.Until(deadline))
+			case <-stopTimeoutWatch:
+				return
+			}
+		}
+	}()
+
 	registry := prometheus.NewRegistry()
 	registry.MustRegister(probeSuccessGauge)
 	registry.MustRegister(probeDurationGauge)
 	registry.MustRegister(probeTimeoutGauge)
 	success := prober(ctx, target, module, registry, slLogger)
-	duration := time.Since(start).Seconds()
-	probeDurationGauge.Set(duration)
-	probeTimeoutGauge.Set(timeoutSeconds)
-	if success {
-		probeSuccessGauge.Set(1)
-		slLogger.Debug("Probe succeeded", "duration_seconds", duration)
-	} else {
-		slLogger.Error("Probe failed", "duration_seconds", duration)
+	probeEnd := time.Now()
+	close(stopTimeoutWatch)
+	<-timeoutWatchDone
+	ctx.finish(context.Canceled)
+
+	updated := false
+	select {
+	case <-configUpdates:
+		updated = true
+	default:
+	}
+	if updated {
+		if finalConfig, _ := source.Snapshot(); finalConfig != nil {
+			if finalModule, ok := finalConfig.Modules[moduleName]; ok {
+				if finalTimeoutSeconds, err := getTimeout(timeoutRequest, finalModule, timeoutOffset); err == nil {
+					finalTimeout := time.Duration(finalTimeoutSeconds * float64(time.Second))
+					currentTimeout.Store(int64(finalTimeout))
+					ctx.setDeadline(start.Add(finalTimeout))
+				}
+			}
+		}
 	}
 
-	debugOutput := DebugOutput(&module, sl.buffer, registry)
+	duration := probeEnd.Sub(start)
+	deadline, _ := ctx.Deadline()
+	if success && probeEnd.After(deadline) {
+		success = false
+		slLogger.Debug("Probe exceeded timeout", "duration_seconds", duration.Seconds(), "timeout_seconds", time.Duration(currentTimeout.Load()).Seconds())
+	}
+	durationSeconds := duration.Seconds()
+	probeDurationGauge.Set(durationSeconds)
+	probeTimeoutGauge.Set(time.Duration(currentTimeout.Load()).Seconds())
+	if success {
+		probeSuccessGauge.Set(1)
+		slLogger.Debug("Probe succeeded", "duration_seconds", durationSeconds)
+	} else {
+		slLogger.Error("Probe failed", "duration_seconds", durationSeconds)
+	}
+
+	debugModule := module
+	debugModule.Timeout = time.Duration(currentTimeout.Load())
+	debugOutput := DebugOutput(&debugModule, sl.buffer, registry)
 	rh.Add(moduleName, target, debugOutput, success)
 
 	if r.URL.Query().Get("debug") == "true" {
@@ -175,6 +302,7 @@ type scrapeLogger struct {
 	buffer       *bytes.Buffer
 	bufferLogger *slog.Logger
 	config       *promslog.Config
+	mu           *sync.Mutex
 }
 
 // Enabled returns true if both A) the scrapeLogger's internal `next` logger
@@ -192,6 +320,9 @@ func (sl *scrapeLogger) Enabled(ctx context.Context, level slog.Level) bool {
 // the internal bufferLogger for use with serving debug output. It implements
 // slog.Handler.
 func (sl *scrapeLogger) Handle(ctx context.Context, r slog.Record) error {
+	sl.mu.Lock()
+	defer sl.mu.Unlock()
+
 	var errs []error
 	rec := r.Clone()
 
@@ -216,6 +347,7 @@ func (sl *scrapeLogger) WithAttrs(attrs []slog.Attr) slog.Handler {
 		buffer:       sl.buffer,
 		bufferLogger: slog.New(sl.bufferLogger.Handler().WithAttrs(attrs)),
 		config:       sl.config,
+		mu:           sl.mu,
 	}
 }
 
@@ -227,6 +359,7 @@ func (sl *scrapeLogger) WithGroup(name string) slog.Handler {
 		buffer:       sl.buffer,
 		bufferLogger: slog.New(sl.bufferLogger.Handler().WithGroup(name)),
 		config:       sl.config,
+		mu:           sl.mu,
 	}
 }
 
@@ -249,6 +382,7 @@ func newScrapeLogger(config *promslog.Config, module, target string) *scrapeLogg
 		buffer:       &buf,
 		bufferLogger: bl.With("module", module, "target", target),
 		config:       config,
+		mu:           &sync.Mutex{},
 	}
 	return sl
 }

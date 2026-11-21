@@ -258,11 +258,9 @@ func ProbeDNS(ctx context.Context, target string, module config.Module, registry
 	msg.Question[0] = dns.Question{Name: dns.Fqdn(module.DNS.QueryName), Qtype: qt, Qclass: qc}
 
 	logger.Debug("Making DNS query", "target", targetIP, "dial_protocol", dialProtocol, "query", module.DNS.QueryName, "type", qt, "class", qc)
-	timeoutDeadline, _ := ctx.Deadline()
-	client.Timeout = time.Until(timeoutDeadline)
 	requestStart := time.Now()
-	response, rtt, err := client.Exchange(msg, targetIP)
-	// The rtt value returned from client.Exchange includes only the time to
+	response, rtt, err := client.ExchangeContext(ctx, msg, targetIP)
+	// The rtt value returned from client.ExchangeContext includes only the time to
 	// exchange messages with the server _after_ the connection is created.
 	// We compute the connection time as the total time for the operation
 	// minus the time for the actual request rtt.

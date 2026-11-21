@@ -45,11 +45,9 @@ func dialUnix(ctx context.Context, target string, module config.Module, _ *prome
 			return nil, tlsErr
 		}
 
-		timeoutDeadline, _ := ctx.Deadline()
-		dialer.Deadline = timeoutDeadline
-
 		logger.Debug("Dialing unix with TLS")
-		conn, err = tls.DialWithDialer(dialer, "unix", target, tlsConfig)
+		tlsDialer := &tls.Dialer{NetDialer: dialer, Config: tlsConfig}
+		conn, err = tlsDialer.DialContext(ctx, "unix", target)
 	}
 
 	if err != nil {
