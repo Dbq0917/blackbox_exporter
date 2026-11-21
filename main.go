@@ -83,6 +83,7 @@ func run() int {
 	kingpin.Parse()
 	logger := promslog.New(promslogConfig)
 	rh := &prober.ResultHistory{MaxResults: *historyLimit}
+	probeCoordinator := prober.NewProbeCoordinator()
 
 	probeLogLevel := promslog.NewLevel()
 	if err := probeLogLevel.Set(*logLevelProber); err != nil {
@@ -208,7 +209,7 @@ func run() int {
 		sc.Lock()
 		conf := sc.C
 		sc.Unlock()
-		prober.Handler(w, r, conf, logger, rh, *timeoutOffset, nil, moduleUnknownCounter, scrapeLoggerConfig)
+		prober.HandlerWithCoordinator(w, r, conf, logger, rh, *timeoutOffset, nil, moduleUnknownCounter, probeCoordinator, scrapeLoggerConfig)
 	})
 	http.HandleFunc(*routePrefix, func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/html")

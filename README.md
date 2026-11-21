@@ -189,6 +189,11 @@ Additional modules can be defined to meet your needs.
 The timeout of each probe is automatically determined from the `scrape_timeout` in the [Prometheus config](https://prometheus.io/docs/operating/configuration/#configuration-file), slightly reduced to allow for network delays. 
 This can be further limited by the `timeout` in the Blackbox exporter config file. If neither is specified, it defaults to 120 seconds.
 
+Concurrent probes for the same module, target and hostname are coalesced. If a
+retry arrives while the previous probe is still running, it waits for and
+returns the same result instead of starting a second probe. Once that probe
+finishes, the next request starts a fresh probe.
+
 ## Prometheus Configuration
 
 Blackbox exporter implements the multi-target exporter pattern, so we advice

@@ -48,6 +48,16 @@ func Handler(w http.ResponseWriter, r *http.Request, c *config.Config, logger *s
 	moduleUnknownCounter prometheus.Counter,
 	promslogConfig *promslog.Config,
 ) {
+	HandlerWithCoordinator(w, r, c, logger, rh, timeoutOffset, params, moduleUnknownCounter, nil, promslogConfig)
+}
+
+// HandlerWithCoordinator behaves like Handler and additionally coalesces
+// concurrent probes for the same module, target and hostname through
+// coordinator. A nil coordinator disables coalescing.
+func HandlerWithCoordinator(w http.ResponseWriter, r *http.Request, c *config.Config, logger *slog.Logger, rh *ResultHistory, timeoutOffset float64, params url.Values,
+	moduleUnknownCounter prometheus.Counter, coordinator *ProbeCoordinator,
+	promslogConfig *promslog.Config,
+) {
 	if params == nil {
 		params = r.URL.Query()
 	}
@@ -74,19 +84,6 @@ func Handler(w http.ResponseWriter, r *http.Request, c *config.Config, logger *s
 	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(timeoutSeconds*float64(time.Second)))
 	defer cancel()
 	r = r.WithContext(ctx)
-
-	probeSuccessGauge := prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "probe_success",
-		Help: "Displays whether or not the probe was a success",
-	})
-	probeDurationGauge := prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "probe_duration_seconds",
-		Help: "Returns how long the probe took to complete in seconds",
-	})
-	probeTimeoutGauge := prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "probe_timeout_seconds",
-		Help: "Returns how long the probe timeout is in seconds",
-	})
 
 	target := params.Get("target")
 	if target == "" {
@@ -122,7 +119,45 @@ func Handler(w http.ResponseWriter, r *http.Request, c *config.Config, logger *s
 	sl := newScrapeLogger(promslogConfig, moduleName, target)
 	slLogger := slog.New(sl)
 
+	result, err := coordinator.do(ctx, probeKey{
+		moduleName: moduleName,
+		target:     target,
+		hostname:   hostname,
+	}, func() probeResult {
+		return runProbe(ctx, target, module, prober, timeoutSeconds, rh, sl, slLogger, moduleName)
+	})
+	if err != nil {
+		slLogger.Debug("Stopped waiting for in-flight probe", "err", err)
+		return
+	}
+
+	if r.URL.Query().Get("debug") == "true" {
+		w.Header().Set("Content-Type", "text/plain")
+		w.Write([]byte(result.debugOutput))
+		return
+	}
+
+	h := promhttp.HandlerFor(result.registry, promhttp.HandlerOpts{})
+	h.ServeHTTP(w, r)
+}
+
+func runProbe(ctx context.Context, target string, module config.Module, prober ProbeFn, timeoutSeconds float64,
+	rh *ResultHistory, sl *scrapeLogger, slLogger *slog.Logger, moduleName string,
+) probeResult {
 	slLogger.Debug("Beginning probe", "probe", module.Prober, "timeout_seconds", timeoutSeconds)
+
+	probeSuccessGauge := prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "probe_success",
+		Help: "Displays whether or not the probe was a success",
+	})
+	probeDurationGauge := prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "probe_duration_seconds",
+		Help: "Returns how long the probe took to complete in seconds",
+	})
+	probeTimeoutGauge := prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "probe_timeout_seconds",
+		Help: "Returns how long the probe timeout is in seconds",
+	})
 
 	start := time.Now()
 	registry := prometheus.NewRegistry()
@@ -143,14 +178,10 @@ func Handler(w http.ResponseWriter, r *http.Request, c *config.Config, logger *s
 	debugOutput := DebugOutput(&module, sl.buffer, registry)
 	rh.Add(moduleName, target, debugOutput, success)
 
-	if r.URL.Query().Get("debug") == "true" {
-		w.Header().Set("Content-Type", "text/plain")
-		w.Write([]byte(debugOutput))
-		return
+	return probeResult{
+		registry:    registry,
+		debugOutput: debugOutput,
 	}
-
-	h := promhttp.HandlerFor(registry, promhttp.HandlerOpts{})
-	h.ServeHTTP(w, r)
 }
 
 func setHTTPHost(hostname string, module *config.Module) error {

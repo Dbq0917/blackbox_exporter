@@ -20,8 +20,11 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -71,6 +74,67 @@ func TestPrometheusTimeoutHTTP(t *testing.T) {
 
 	if !strings.Contains(rr.Body.String(), "probe_timeout_seconds 0.5") {
 		t.Errorf("probe failed, response body: %v", rr.Body.String())
+	}
+}
+
+func TestPrometheusTimeoutCoalescesRetry(t *testing.T) {
+	var requests atomic.Int32
+	requestStarted := make(chan struct{})
+	releaseRequest := make(chan struct{})
+	ts := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+		if requests.Add(1) == 1 {
+			close(requestStarted)
+		}
+		<-releaseRequest
+	}))
+	defer ts.Close()
+
+	c := &config.Config{
+		Modules: map[string]config.Module{
+			"http_2xx": {
+				Prober:  "http",
+				Timeout: 10 * time.Second,
+				HTTP: config.HTTPProbe{
+					IPProtocolFallback: true,
+				},
+			},
+		},
+	}
+	coordinator := NewProbeCoordinator()
+	history := &ResultHistory{MaxResults: 10}
+
+	serve := func(timeout string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/probe?target="+url.QueryEscape(ts.URL), nil)
+		req.Header.Set("X-Prometheus-Scrape-Timeout-Seconds", timeout)
+
+		rr := httptest.NewRecorder()
+		HandlerWithCoordinator(rr, req, c, promslog.NewNopLogger(), history, 0.5, nil, nil, coordinator, &promslog.Config{})
+		return rr
+	}
+
+	var wg sync.WaitGroup
+	var first, retry *httptest.ResponseRecorder
+	wg.Go(func() {
+		first = serve("1")
+	})
+	<-requestStarted
+	wg.Go(func() {
+		retry = serve("2")
+	})
+	wg.Wait()
+	close(releaseRequest)
+
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("target was probed %d times, want 1", got)
+	}
+	if got := len(history.List()); got != 1 {
+		t.Fatalf("history contains %d results, want 1", got)
+	}
+	if first.Body.String() != retry.Body.String() {
+		t.Fatalf("timed-out probe and retry returned different metrics:\nfirst:\n%s\nretry:\n%s", first.Body.String(), retry.Body.String())
+	}
+	if !strings.Contains(first.Body.String(), "probe_success 0") {
+		t.Fatalf("timed-out probe did not report failure: %s", first.Body.String())
 	}
 }
 
